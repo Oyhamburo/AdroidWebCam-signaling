@@ -21,7 +21,12 @@
     });
 
     const ws = new WebSocket(`ws://${location.host}`);
-    ws.onopen = () => ws.send(JSON.stringify({ role: "browser" }));
+
+    ws.onopen = () => {
+      ws.send(JSON.stringify({ role: "browser" }));
+      // Avisamos que estamos listos para recibir la oferta del Android
+      ws.send(JSON.stringify({ type: "browser-ready" }));
+    };
 
     ws.onmessage = async (ev) => {
       const msg = JSON.parse(ev.data);
@@ -42,7 +47,6 @@
       }
 
       if (msg.type === "orientation") {
-        // si querés, adaptá estilos según portrait/landscape
         document.body.dataset.orientation = msg.orientation;
       }
     };
