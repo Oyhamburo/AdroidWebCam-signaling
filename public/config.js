@@ -8,8 +8,8 @@ let refreshTimer = null;
 let lastCfg = null;   // último /api/config recibido (para sincronizar)
 let CAPS = null;      // /api/caps: { cameras:[{name,label,facing}], formatsByCameraName:{...}, supportedAspects:[...] }
 
-const markDirty = () => { formDirty = true; };
-const clearDirty = () => { formDirty = false; };
+const markDirty = () => { formDirty = true; $("#btnSave").disabled = false; };
+const clearDirty = () => { formDirty = false; $("#btnSave").disabled = true; };
 
 // ===== Utils de aspecto =====
 const isClose = (a,b,t=0.02)=>Math.abs(a-b)<t;
@@ -41,9 +41,11 @@ const FALLBACK_QUALS = {
 async function tryLoadCaps(){
   try{
     const r = await fetch("/api/caps",{cache:"no-store"});
-    console.log("Caps:", r.status);
     if(!r.ok) return;
     CAPS = await r.json();
+    $("#capsHint").textContent = CAPS.cameras?.length
+      ? `Cámaras detectadas: ${CAPS.cameras.length}`
+      : `Aún no hay capacidades publicadas. Conectá el teléfono y presioná “Actualizar capacidades del teléfono”.`;
   }catch(_){}
 }
 
@@ -182,7 +184,6 @@ async function loadConfig(updateForm=true){
   $("stAndroid").innerHTML = cfg.androidConnected ? '<span class="ok">conectado</span>' : '<span class="bad">desconectado</span>';
   $("stBrowser").innerHTML = cfg.browserConnected ? '<span class="ok">conectado</span>' : '<span class="bad">desconectado</span>';
 
-  // Si hay cambios sin guardar, no tocamos el formulario (solo estados arriba)
   if(!updateForm) return;
 
   $("micEnabled").checked = !!cfg.micEnabled;
@@ -197,6 +198,8 @@ async function loadConfig(updateForm=true){
 
   // Bitrate
   syncBitrateUI(cfg.bitrateKbps ?? 6000);
+
+  clearDirty();
 }
 
 async function saveConfig(){
@@ -234,12 +237,11 @@ async function saveConfig(){
   }finally{ isSaving=false; }
 }
 
-// ===== Listeners (no aplican nada hasta “Aplicar cambios”) =====
+// ===== Listeners =====
 $("micEnabled").addEventListener("change", markDirty);
 
 $("camera").addEventListener("change", ()=>{
   markDirty();
-  // Al cambiar de cámara, regeneramos calidades tomando como referencia lo último recibido
   const base = lastCfg
     ? { w:lastCfg.width, h:lastCfg.height, fps:lastCfg.fps }
     : { w:1280, h:720, fps:30 };
@@ -258,6 +260,24 @@ $("bitrateKbps").addEventListener("input", e=>{ syncBitrateUI(e.target.value); m
 
 $("btnSave").addEventListener("click", saveConfig);
 $("btnRefresh").addEventListener("click", ()=>loadConfig(!formDirty));
+
+$("btnRequestCaps").addEventListener("click", async ()=>{
+  try{
+    const r = await fetch("/api/request-caps", { method:"POST" });
+    const out = await r.json();
+    if(!out.ok){
+      alert(out.error || "No se pudo solicitar capacidades.");
+      return;
+    }
+    // Esperá un instante a que el teléfono publique /caps y recargamos
+    setTimeout(async ()=>{
+      await tryLoadCaps();
+      await loadConfig(!formDirty);
+    }, 600);
+  }catch(e){
+    alert("Error al solicitar capacidades: "+e.message);
+  }
+});
 
 // ===== Init =====
 (async()=>{

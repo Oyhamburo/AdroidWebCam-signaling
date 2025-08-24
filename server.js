@@ -1,4 +1,3 @@
-// server.js
 // npm i express ws
 const http = require("http");
 const express = require("express");
@@ -10,29 +9,11 @@ const PORT = 8080;
 
 const app = express();
 
-// ---------- Util logging ----------
-const ts = () => new Date().toISOString().replace("T"," ").replace("Z","");
-const shorten = (s, n=200) => (s.length > n ? s.slice(0,n) + `…(+${s.length-n})` : s);
-const ipOf = (req) => (req.headers["x-forwarded-for"]?.split(",")[0]?.trim()) || req.socket.remoteAddress;
-
-// ---------- Middleware ----------
+// --------- Middleware / estáticos ----------
 app.use(express.json());
-
-// HTTP access log compacto
-app.use((req, res, next) => {
-  const start = Date.now();
-  const ip = ipOf(req);
-  const ua = req.headers["user-agent"] || "-";
-  res.on("finish", () => {
-    console.log(`[${ts()}] HTTP ${req.method} ${req.url} ${res.statusCode} ip=${ip} ua=${shorten(ua,120)} tt=${Date.now()-start}ms`);
-  });
-  next();
-});
-
-// estáticos
 app.use(express.static(path.join(__dirname, "public")));
 
-// ---------- Estado global ----------
+// --------- Estado global ----------
 let android = null; // socket del teléfono
 let browser = null; // socket del navegador (visor)
 
@@ -46,46 +27,36 @@ const state = {
     fps: 30,
     bitrateKbps: 6000,
     aspect: "AUTO_MAX",
-    camera: "back",
-    cameraName: null
+    camera: "back",        // compat: "back" | "front"
+    cameraName: null       // deviceName exacto (p.ej. "0","1","3")
   },
   caps: {
-    cameras: [],
-    formatsByCameraName: {},
+    cameras: [],                 // [{name,label,facing}]
+    formatsByCameraName: {},     // {"0":[{w,h,fps:[..]}], ...}
     supportedAspects: ["AUTO_MAX","R16_9","R4_3","R1_1"]
   }
 };
 
-// Métricas/debug
-const metrics = {
-  startAt: new Date().toISOString(),
-  wsNextId: 1,
-  clients: {}, // id -> {role, ip, ua, connectedAt, lastMsgAt, lastPongAt}
-  lastEvents: [], // ring buffer simple
-  connectCounts: { android:0, browser:0, unknown:0 },
-  lastAndroidMsgAt: null,
-  lastBrowserMsgAt: null,
-  lastErrors: []
-};
-const pushEvent = (e) => {
-  metrics.lastEvents.push({ t: ts(), ...e });
-  if (metrics.lastEvents.length > 200) metrics.lastEvents.shift();
-};
+// --------- Helpers de log ----------
+function now() {
+  return new Date().toISOString().replace("T", " ").replace("Z", "");
+}
+function log(...a) { console.log(`[${now()}]`, ...a); }
 
-// ---------- API: /api/config ----------
+// --------- API: /api/config ----------
 app.get("/api/config", (req, res) => {
-  console.log(`[${ts()}] GET /api/config -> android=${state.androidConnected} browser=${state.browserConnected}`);
-  res.json({
+  const out = {
     connected: state.androidConnected || state.browserConnected,
     androidConnected: state.androidConnected,
     browserConnected: state.browserConnected,
     ...state.config
-  });
+  };
+  log("GET /api/config -> android=%s browser=%s", out.androidConnected, out.browserConnected);
+  res.json(out);
 });
 
 app.post("/api/config", (req, res) => {
   const body = req.body || {};
-  console.log(`[${ts()}] POST /api/config body=${shorten(JSON.stringify(body), 300)}`);
 
   state.config = {
     ...state.config,
@@ -99,24 +70,25 @@ app.post("/api/config", (req, res) => {
     cameraName: (body.cameraName ?? state.config.cameraName)
   };
 
+  log("POST /api/config -> apply width=%d height=%d fps=%d br=%d aspect=%s cam=%s camName=%s",
+    state.config.width, state.config.height, state.config.fps, state.config.bitrateKbps,
+    state.config.aspect, state.config.camera, state.config.cameraName);
+
   // reenviar la config al teléfono si está conectado
-  if (android && android.readyState === android.OPEN) {
-    try {
+  try {
+    if (android && android.readyState === android.OPEN) {
       android.send(JSON.stringify({ type: "config", ...state.config }));
-      console.log(`[${ts()}] -> Enviada config a ANDROID`);
-    } catch (e) {
-      console.warn(`[${ts()}] [WS] Error enviando config al ANDROID: ${e.message}`);
     }
-  } else {
-    console.warn(`[${ts()}] ANDROID no conectado: no se reenvía config`);
+  } catch (e) {
+    log("[WS] Error enviando config al Android:", e.message);
   }
 
   res.json({ ok: true });
 });
 
-// ---------- API: /api/caps ----------
+// --------- API: /api/caps ----------
 app.get("/api/caps", (req, res) => {
-  console.log(`[${ts()}] GET /api/caps cameras=${state.caps.cameras.length}`);
+  log("GET /api/caps cameras=%d", state.caps.cameras.length);
   res.json({
     ...state.caps,
     current: {
@@ -129,47 +101,33 @@ app.get("/api/caps", (req, res) => {
   });
 });
 
-// ---------- API: /api/debug ----------
-app.get("/api/debug", (req, res) => {
-  const summary = {
-    now: new Date().toISOString(),
-    state: {
-      androidConnected: state.androidConnected,
-      browserConnected: state.browserConnected,
-      config: state.config,
-      capsSummary: {
-        cameras: state.caps.cameras.length,
-        camsSample: state.caps.cameras.slice(0,3),
-        aspects: state.caps.supportedAspects
-      }
-    },
-    metrics: {
-      ...metrics,
-      clients: undefined // oculto detalle grande
-    },
-    clients: Object.fromEntries(Object.entries(metrics.clients).map(([id, c]) => [
-      id, { ...c, ua: shorten(c.ua || "-", 120) }
-    ]))
-  };
-  res.json(summary);
+// --------- NUEVO: pedir al Android que reenvíe capacidades ----------
+app.post("/api/request-caps", (req, res) => {
+  const ok = !!(android && android.readyState === android.OPEN);
+  if (!ok) {
+    log("POST /api/request-caps -> android conectado? %s", ok);
+    return res.status(503).json({ ok: false, error: "Android no conectado" });
+  }
+  try {
+    android.send(JSON.stringify({ type: "request-caps" }));
+    log("POST /api/request-caps -> enviado a Android");
+    res.json({ ok: true });
+  } catch (e) {
+    log("POST /api/request-caps -> error enviando: %s", e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
 });
 
-// ---------- HTTP + WS ----------
+// --------- HTTP + WS ----------
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
 
-// Keep-alive para limpiar sockets muertos (con logging)
+// Keep-alive para limpiar sockets muertos
 const HEARTBEAT_MS = 30000;
-function heartbeat() {
-  this.isAlive = true;
-  const meta = metrics.clients[this._id] || {};
-  meta.lastPongAt = ts();
-  metrics.clients[this._id] = meta;
-}
+function heartbeat() { this.isAlive = true; }
 const interval = setInterval(() => {
   wss.clients.forEach((ws) => {
     if (ws.isAlive === false) {
-      console.warn(`[${ts()}] [WS#${ws._id}] sin pong, se termina.`);
       try { ws.terminate(); } catch {}
       return;
     }
@@ -180,87 +138,48 @@ const interval = setInterval(() => {
 
 wss.on("close", () => clearInterval(interval));
 
-// Helpers WS
-function tag(ws) {
-  const role = ws._role || "unknown";
-  return `WS#${ws._id} role=${role} ip=${ws._ip}`;
-}
-function safeSend(target, obj, note = "") {
-  if (!target) return false;
-  if (target.readyState !== target.OPEN) {
-    console.warn(`[${ts()}] [${note}] destino no OPEN (state=${target.readyState})`);
-    return false;
-  }
-  try {
-    const s = JSON.stringify(obj);
-    target.send(s);
-    return true;
-  } catch (e) {
-    console.warn(`[${ts()}] Error enviando [${note}]: ${e.message}`);
-    return false;
-  }
-}
-
+// --------- WS: manejo de mensajes ----------
 wss.on("connection", (ws, req) => {
-  ws._id = metrics.wsNextId++;
-  ws._ip = ipOf(req);
-  ws._ua = req.headers["user-agent"];
-  ws._origin = req.headers["origin"];
-  ws._role = "unknown";
   ws.isAlive = true;
   ws.on("pong", heartbeat);
 
-  metrics.clients[ws._id] = {
-    role: ws._role,
-    ip: ws._ip,
-    ua: ws._ua,
-    origin: ws._origin,
-    connectedAt: ts(),
-    lastMsgAt: null,
-    lastPongAt: ts()
-  };
-  metrics.connectCounts.unknown++;
+  const ip = req.socket.remoteAddress;
+  const ua = req.headers['user-agent'];
+  const origin = req.headers['origin'];
+  const id = [...wss.clients].indexOf(ws) + 1;
+  const total = wss.clients.size;
 
-  console.log(`[${ts()}] Nueva conexión ${tag(ws)} origin=${ws._origin || "-"} ua=${shorten(ws._ua || "-", 120)} total=${wss.clients.size}`);
+  log("Nueva conexión WS#%d role=unknown ip=%s origin=%s ua=%s total=%d", id, ip, origin, ua, total);
 
   ws.on("message", (data) => {
-    const raw = data.toString();
-    metrics.clients[ws._id].lastMsgAt = ts();
-
     let msg;
-    try { msg = JSON.parse(raw); }
-    catch {
-      console.warn(`[${ts()}] ${tag(ws)} mensaje no JSON: ${shorten(raw, 200)}`);
-      return;
-    }
-
-    const mtype = msg.type || msg.role || "unknown";
-    console.log(`[${ts()}] ${tag(ws)} ← msg type=${mtype} bytes=${raw.length}`);
+    try { msg = JSON.parse(data.toString()); } catch { return; }
 
     // Identificación de rol
-    if (msg.role === "android" || msg.role === "browser") {
-      const prev = ws._role;
-      ws._role = msg.role;
-      metrics.clients[ws._id].role = ws._role;
-
-      if (msg.role === "android") {
-        android = ws;
-        state.androidConnected = true;
-        metrics.connectCounts.android++;
-        console.log(`[${ts()}] ${tag(ws)} Rol asignado: ANDROID (antes=${prev})`);
-        // Pedimos capacidades y mandamos config actual
-        safeSend(android, { type: "request-caps" }, "request-caps");
-        safeSend(android, { type: "config", ...state.config }, "initial-config");
-      } else if (msg.role === "browser") {
-        browser = ws;
-        state.browserConnected = true;
-        metrics.connectCounts.browser++;
-        console.log(`[${ts()}] ${tag(ws)} Rol asignado: BROWSER (antes=${prev})`);
+    if (msg.role === "android") {
+      android = ws;
+      state.androidConnected = true;
+      log("WS#%d role=ANDROID (antes=unknown)", id);
+      // Pedimos capacidades al conectar
+      try { android.send(JSON.stringify({ type: "request-caps" })); } catch {}
+      // Enviar config actual
+      try { android.send(JSON.stringify({ type: "config", ...state.config })); } catch {}
+      return;
+    }
+    if (msg.role === "browser") {
+      browser = ws;
+      state.browserConnected = true;
+      log("WS#%d role=BROWSER (antes=unknown)", id);
+      // Aviso al Android que el browser está listo (triggers offer)
+      if (android && android.readyState === android.OPEN) {
+        try { android.send(JSON.stringify({ type: "browser-ready" })); } catch {}
       }
       return;
     }
 
-    // Caps del teléfono
+    if (msg.type) log("WS#%d ← msg type=%s bytes=%d", id, msg.type, data.length);
+
+    // Teléfono nos publica capacidades
     if (msg.type === "caps") {
       const caps = (msg.payload && typeof msg.payload === "object") ? msg.payload : msg;
       state.caps = {
@@ -270,78 +189,54 @@ wss.on("connection", (ws, req) => {
         supportedAspects: Array.isArray(caps.supportedAspects) && caps.supportedAspects.length
           ? caps.supportedAspects : ["AUTO_MAX","R16_9","R4_3","R1_1"]
       };
-      console.log(`[${ts()}] ${tag(ws)} CAPS actualizadas. cameras=${state.caps.cameras.length}`);
-      pushEvent({ kind:"caps", from: ws._role, count: state.caps.cameras.length });
+      log("[WS] CAPS actualizadas. Cámaras: %d", state.caps.cameras.length);
       return;
     }
 
-    // Reenvío de orientación
-    if (msg.type === "orientation") {
-      if (ws === android && browser) {
-        const ok = safeSend(browser, { type:"orientation", orientation: msg.orientation }, "orientation->browser");
-        console.log(`[${ts()}] ${tag(ws)} orientation "${msg.orientation}" reenviado=${ok}`);
-      }
-      return;
-    }
-
-    // Señalización
+    // Mensajería de señalización
     if (msg.type === "offer" || msg.type === "answer" || msg.type === "ice") {
-      if (ws === android && browser) {
-        const ok = safeSend(browser, msg, `sig:${msg.type} android->browser`);
-        console.log(`[${ts()}] ${tag(ws)} fwd ${msg.type} to BROWSER ok=${ok}`);
-      } else if (ws === browser && android) {
-        const ok = safeSend(android, msg, `sig:${msg.type} browser->android`);
-        console.log(`[${ts()}] ${tag(ws)} fwd ${msg.type} to ANDROID ok=${ok}`);
-      } else {
-        console.warn(`[${ts()}] ${tag(ws)} ${msg.type} recibido pero falta contraparte (android=${!!android} browser=${!!browser})`);
+      if (ws === android && browser && browser.readyState === browser.OPEN) {
+        browser.send(JSON.stringify(msg));
+      } else if (ws === browser && android && android.readyState === android.OPEN) {
+        android.send(JSON.stringify(msg));
       }
-      if (ws._role === "android") metrics.lastAndroidMsgAt = ts();
-      if (ws._role === "browser") metrics.lastBrowserMsgAt = ts();
-      pushEvent({ kind:"signal", type: msg.type, from: ws._role });
       return;
     }
 
-    // Ping
+    // Ping de cliente
     if (msg.type === "ping") {
-      safeSend(ws, { type: "pong" }, "pong");
+      try { ws.send(JSON.stringify({ type: "pong" })); } catch {}
       return;
     }
 
-    // Browser listo
+    // Browser anuncia listo (compat)
     if (msg.type === "browser-ready") {
-      const ok = android ? safeSend(android, { type:"browser-ready" }, "browser-ready") : false;
-      console.log(`[${ts()}] ${tag(ws)} browser-ready -> android ok=${ok}`);
+      if (android && android.readyState === android.OPEN) {
+        try { android.send(JSON.stringify({ type: "browser-ready" })); } catch {}
+      }
       return;
     }
-
-    // Mensaje no reconocido (útil para ver si llega algo inesperado)
-    console.log(`[${ts()}] ${tag(ws)} msg desconocido: ${shorten(JSON.stringify(msg), 300)}`);
   });
 
-  ws.on("close", (code, reasonBuf) => {
-    const reason = reasonBuf?.toString() || "";
-    console.warn(`[${ts()}] Cierre ${tag(ws)} code=${code} reason=${shorten(reason,200)}`);
-
+  ws.on("close", () => {
     if (ws === android) {
       android = null;
       state.androidConnected = false;
-      console.log(`[${ts()}] ANDROID desconectado`);
+      log("[WS] ANDROID desconectado");
     }
     if (ws === browser) {
       browser = null;
       state.browserConnected = false;
-      console.log(`[${ts()}] BROWSER desconectado`);
+      log("[WS] BROWSER desconectado");
     }
-    delete metrics.clients[ws._id];
   });
 
   ws.on("error", (err) => {
-    console.warn(`[${ts()}] Error ${tag(ws)}: ${err.message}`);
-    metrics.lastErrors.push({ t: ts(), id: ws._id, msg: err.message });
-    if (metrics.lastErrors.length > 100) metrics.lastErrors.shift();
+    log("[WS] Error socket:", err.message);
   });
 });
 
+// --------- Arranque ----------
 server.listen(PORT, HOST, () => {
-  console.log(`[${ts()}] HTTP/WS escuchando en http://${HOST}:${PORT}`);
+  log(`HTTP/WS escuchando en http://${HOST}:${PORT}`);
 });
