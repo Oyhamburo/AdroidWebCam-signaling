@@ -1,21 +1,26 @@
+// ===== deps =====
 // npm i express ws
+// (opcional mDNS:)
+// npm i bonjour-service
+// npm i bonjour
 const http = require("http");
 const express = require("express");
 const path = require("path");
+const os = require("os");
 const { WebSocketServer } = require("ws");
 
+// ===== config =====
 const HOST = "0.0.0.0";
 const PORT = 8080;
 
+// ===== app =====
 const app = express();
-
-// --------- Middleware / estáticos ----------
 app.use(express.json());
 app.use(express.static(path.join(__dirname, "public")));
 
-// --------- Estado global ----------
-let android = null; // socket del teléfono
-let browser = null; // socket del navegador (visor)
+// ===== estado =====
+let android = null;
+let browser = null;
 
 const state = {
   androidConnected: false,
@@ -27,37 +32,37 @@ const state = {
     fps: 30,
     bitrateKbps: 6000,
     aspect: "AUTO_MAX",
-    camera: "back",        // compat: "back" | "front"
-    cameraName: null       // deviceName exacto (p.ej. "0","1","3")
+    camera: "back",
+    cameraName: null
   },
   caps: {
-    cameras: [],                 // [{name,label,facing}]
-    formatsByCameraName: {},     // {"0":[{w,h,fps:[..]}], ...}
+    cameras: [],
+    formatsByCameraName: {},
     supportedAspects: ["AUTO_MAX","R16_9","R4_3","R1_1"]
   }
 };
 
-// --------- Helpers de log ----------
+// ===== logging helpers =====
 function now() {
-  return new Date().toISOString().replace("T", " ").replace("Z", "");
+  const d = new Date();
+  return `[${d.toISOString().replace("T"," ").slice(0,23)}]`;
 }
-function log(...a) { console.log(`[${now()}]`, ...a); }
+function log(...a){ console.log(now(), ...a); }
+function warn(...a){ console.warn(now(), ...a); }
 
-// --------- API: /api/config ----------
+// ===== HTTP API =====
 app.get("/api/config", (req, res) => {
-  const out = {
+  log(`GET /api/config -> android=${state.androidConnected} browser=${state.browserConnected}`);
+  res.json({
     connected: state.androidConnected || state.browserConnected,
     androidConnected: state.androidConnected,
     browserConnected: state.browserConnected,
     ...state.config
-  };
-  log("GET /api/config -> android=%s browser=%s", out.androidConnected, out.browserConnected);
-  res.json(out);
+  });
 });
 
 app.post("/api/config", (req, res) => {
   const body = req.body || {};
-
   state.config = {
     ...state.config,
     micEnabled: !!body.micEnabled,
@@ -70,25 +75,19 @@ app.post("/api/config", (req, res) => {
     cameraName: (body.cameraName ?? state.config.cameraName)
   };
 
-  log("POST /api/config -> apply width=%d height=%d fps=%d br=%d aspect=%s cam=%s camName=%s",
-    state.config.width, state.config.height, state.config.fps, state.config.bitrateKbps,
-    state.config.aspect, state.config.camera, state.config.cameraName);
-
-  // reenviar la config al teléfono si está conectado
   try {
     if (android && android.readyState === android.OPEN) {
       android.send(JSON.stringify({ type: "config", ...state.config }));
     }
   } catch (e) {
-    log("[WS] Error enviando config al Android:", e.message);
+    warn("[WS] Error enviando config al Android:", e.message);
   }
 
   res.json({ ok: true });
 });
 
-// --------- API: /api/caps ----------
 app.get("/api/caps", (req, res) => {
-  log("GET /api/caps cameras=%d", state.caps.cameras.length);
+  log(`GET /api/caps cameras=${state.caps.cameras.length}`);
   res.json({
     ...state.caps,
     current: {
@@ -101,28 +100,10 @@ app.get("/api/caps", (req, res) => {
   });
 });
 
-// --------- NUEVO: pedir al Android que reenvíe capacidades ----------
-app.post("/api/request-caps", (req, res) => {
-  const ok = !!(android && android.readyState === android.OPEN);
-  if (!ok) {
-    log("POST /api/request-caps -> android conectado? %s", ok);
-    return res.status(503).json({ ok: false, error: "Android no conectado" });
-  }
-  try {
-    android.send(JSON.stringify({ type: "request-caps" }));
-    log("POST /api/request-caps -> enviado a Android");
-    res.json({ ok: true });
-  } catch (e) {
-    log("POST /api/request-caps -> error enviando: %s", e.message);
-    res.status(500).json({ ok: false, error: e.message });
-  }
-});
-
-// --------- HTTP + WS ----------
+// ===== HTTP + WS =====
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
 
-// Keep-alive para limpiar sockets muertos
 const HEARTBEAT_MS = 30000;
 function heartbeat() { this.isAlive = true; }
 const interval = setInterval(() => {
@@ -135,51 +116,44 @@ const interval = setInterval(() => {
     try { ws.ping(); } catch {}
   });
 }, HEARTBEAT_MS);
-
 wss.on("close", () => clearInterval(interval));
 
-// --------- WS: manejo de mensajes ----------
+let nextId = 1;
 wss.on("connection", (ws, req) => {
   ws.isAlive = true;
   ws.on("pong", heartbeat);
 
-  const ip = req.socket.remoteAddress;
-  const ua = req.headers['user-agent'];
-  const origin = req.headers['origin'];
-  const id = [...wss.clients].indexOf(ws) + 1;
-  const total = wss.clients.size;
+  ws._id = nextId++;
+  ws._role = "unknown";
 
-  log("Nueva conexión WS#%d role=unknown ip=%s origin=%s ua=%s total=%d", id, ip, origin, ua, total);
+  const ip = req.socket.remoteAddress;
+  const ua = (req.headers["user-agent"] || "").slice(0,120);
+  const origin = req.headers.origin || "";
+  log(`Nueva conexión WS#${ws._id} role=${ws._role} ip=${ip} origin=${origin} ua=${ua} total=${wss.clients.size}`);
 
   ws.on("message", (data) => {
     let msg;
     try { msg = JSON.parse(data.toString()); } catch { return; }
 
-    // Identificación de rol
     if (msg.role === "android") {
+      ws._role = "android";
       android = ws;
       state.androidConnected = true;
-      log("WS#%d role=ANDROID (antes=unknown)", id);
-      // Pedimos capacidades al conectar
+      log(`WS#${ws._id} role=${ws._role} ip=${ip} Rol asignado: ANDROID (antes=unknown)`);
       try { android.send(JSON.stringify({ type: "request-caps" })); } catch {}
-      // Enviar config actual
       try { android.send(JSON.stringify({ type: "config", ...state.config })); } catch {}
       return;
     }
     if (msg.role === "browser") {
+      ws._role = "browser";
       browser = ws;
       state.browserConnected = true;
-      log("WS#%d role=BROWSER (antes=unknown)", id);
-      // Aviso al Android que el browser está listo (triggers offer)
-      if (android && android.readyState === android.OPEN) {
-        try { android.send(JSON.stringify({ type: "browser-ready" })); } catch {}
-      }
+      log(`WS#${ws._id} role=${ws._role} ip=${ip} Rol asignado: BROWSER (antes=unknown)`);
       return;
     }
 
-    if (msg.type) log("WS#%d ← msg type=%s bytes=%d", id, msg.type, data.length);
+    log(`WS#${ws._id} role=${ws._role} ip=${ip} ← msg type=${msg.type} bytes=${data.length}`);
 
-    // Teléfono nos publica capacidades
     if (msg.type === "caps") {
       const caps = (msg.payload && typeof msg.payload === "object") ? msg.payload : msg;
       state.caps = {
@@ -189,11 +163,10 @@ wss.on("connection", (ws, req) => {
         supportedAspects: Array.isArray(caps.supportedAspects) && caps.supportedAspects.length
           ? caps.supportedAspects : ["AUTO_MAX","R16_9","R4_3","R1_1"]
       };
-      log("[WS] CAPS actualizadas. Cámaras: %d", state.caps.cameras.length);
+      log(`[WS] CAPS actualizadas. Cámaras: ${state.caps.cameras.length}`);
       return;
     }
 
-    // Mensajería de señalización
     if (msg.type === "offer" || msg.type === "answer" || msg.type === "ice") {
       if (ws === android && browser && browser.readyState === browser.OPEN) {
         browser.send(JSON.stringify(msg));
@@ -203,16 +176,23 @@ wss.on("connection", (ws, req) => {
       return;
     }
 
-    // Ping de cliente
     if (msg.type === "ping") {
       try { ws.send(JSON.stringify({ type: "pong" })); } catch {}
       return;
     }
 
-    // Browser anuncia listo (compat)
     if (msg.type === "browser-ready") {
-      if (android && android.readyState === android.OPEN) {
+      const ok = !!(android && android.readyState === android.OPEN);
+      log(`WS#${ws._id} role=${ws._role} ip=${ip} browser-ready -> android ok=${ok}`);
+      if (ok) {
         try { android.send(JSON.stringify({ type: "browser-ready" })); } catch {}
+      }
+      return;
+    }
+
+    if (msg.type === "orientation") {
+      if (browser && browser.readyState === browser.OPEN) {
+        try { browser.send(JSON.stringify(msg)); } catch {}
       }
       return;
     }
@@ -222,21 +202,184 @@ wss.on("connection", (ws, req) => {
     if (ws === android) {
       android = null;
       state.androidConnected = false;
-      log("[WS] ANDROID desconectado");
+      log(`[WS] ANDROID desconectado (#${ws._id})`);
     }
     if (ws === browser) {
       browser = null;
       state.browserConnected = false;
-      log("[WS] BROWSER desconectado");
+      log(`[WS] BROWSER desconectado (#${ws._id})`);
     }
   });
 
   ws.on("error", (err) => {
-    log("[WS] Error socket:", err.message);
+    warn("[WS] Error socket:", err.message);
   });
 });
 
-// --------- Arranque ----------
+// ===== arranque HTTP/WS =====
 server.listen(PORT, HOST, () => {
   log(`HTTP/WS escuchando en http://${HOST}:${PORT}`);
+  mdns.start(); // <- publicar mDNS al arrancar
 });
+
+// ===== mDNS / Bonjour =====
+const mdns = (function makeMdns() {
+  let bonjour = null;
+  let mdnsSvc = null;
+  let libName = "none";
+  let lastError = null;
+  let publishStarted = false;
+  let upEventFired = false;
+
+  function safeRequire(name) {
+    try { return require(name); } catch (e) { return { __error: e }; }
+  }
+
+  function listIfs() {
+    const ifs = os.networkInterfaces();
+    const ipv4 = Object.values(ifs).flat().filter(Boolean)
+      .filter(i => i.family === "IPv4" && !i.internal)
+      .map(i => `${i.address}/${i.netmask} (${i.mac || "no-mac"})`);
+    return ipv4;
+  }
+
+  function tryLoadBonjour() {
+    // 1) bonjour-service (constructor)
+    const modA = safeRequire("bonjour-service");
+    if (!modA.__error) {
+      const exp = modA && (modA.default || modA);
+      log("[mDNS] inspección bonjour-service:",
+          `typeof=${typeof exp}`,
+          `keys=${Object.keys(modA||{}).join(",") || "(none)"}`);
+      if (typeof exp === "function") {
+        try {
+          bonjour = new exp();
+          libName = "bonjour-service (ctor)";
+          return true;
+        } catch (e) {
+          warn("[mDNS] bonjour-service no se pudo instanciar como constructor:", e.message);
+        }
+      } else if (exp && typeof exp.Bonjour === "function") {
+        try {
+          bonjour = new exp.Bonjour();
+          libName = "bonjour-service (exp.Bonjour)";
+          return true;
+        } catch (e) {
+          warn("[mDNS] bonjour-service exp.Bonjour falló:", e.message);
+        }
+      }
+    } else {
+      warn("[mDNS] require('bonjour-service') falló:", modA.__error.message);
+    }
+
+    // 2) bonjour (factory)
+    const modB = safeRequire("bonjour");
+    if (!modB.__error) {
+      const exp = modB && (modB.default || modB);
+      log("[mDNS] inspección bonjour:",
+          `typeof=${typeof exp}`,
+          `keys=${Object.keys(modB||{}).join(",") || "(none)"}`);
+      if (typeof exp === "function") {
+        try {
+          bonjour = exp(); // factory
+          libName = "bonjour (factory)";
+          return true;
+        } catch (e) {
+          warn("[mDNS] bonjour factory falló:", e.message);
+        }
+      } else {
+        warn("[mDNS] 'bonjour' no es función. typeof=", typeof exp);
+      }
+    } else {
+      warn("[mDNS] require('bonjour') falló:", modB.__error.message);
+    }
+
+    return false;
+  }
+
+  function publish() {
+    if (!bonjour) {
+      lastError = "No hay instancia bonjour cargada";
+      warn("[mDNS] No se pudo publicar: bonjour=null");
+      return false;
+    }
+    const serviceName = `Celsocam @ ${os.hostname()}`;
+    try {
+      mdnsSvc = bonjour.publish({
+        name: serviceName,
+        type: "celsocam", // _celsocam._tcp
+        port: PORT,
+        txt: { ver: "1", ws: "1", path: "/" }
+      });
+
+      publishStarted = true;
+      upEventFired = false;
+
+      // eventos soportados por ambas libs (si existen)
+      mdnsSvc.on?.("up", () => {
+        upEventFired = true;
+        log(`[mDNS] UP name="${serviceName}" type=_celsocam._tcp port=${PORT}`);
+      });
+      mdnsSvc.on?.("error", (e) => {
+        lastError = e?.message || String(e);
+        warn("[mDNS] Error publicación:", lastError);
+      });
+
+      // algunas versiones requieren start() explícito
+      if (typeof mdnsSvc.start === "function") {
+        mdnsSvc.start();
+        log("[mDNS] mdnsSvc.start() llamado");
+      }
+
+      // log de interfaces
+      const ifs = listIfs();
+      log("[mDNS] interfaces LAN:", ifs.join(", ") || "(ninguna)");
+
+      return true;
+    } catch (e) {
+      lastError = e.message;
+      warn("[mDNS] publish error:", lastError);
+      return false;
+    }
+  }
+
+  function start() {
+    const ok = tryLoadBonjour();
+    if (!ok) {
+      lastError = "No se pudo cargar ni 'bonjour-service' ni 'bonjour'. ¿Instalados?";
+      warn("[mDNS] " + lastError);
+      return;
+    }
+    log(`[mDNS] usando librería: ${libName}`);
+    publish();
+  }
+
+  function stop(cb) {
+    try { mdnsSvc?.stop?.(() => log("[mDNS] stop ok")); } catch {}
+    try { bonjour?.destroy?.(); } catch {}
+    if (cb) cb();
+  }
+
+  // endpoint de depuración
+  app.get("/debug/mdns", (_req, res) => {
+    res.json({
+      libName,
+      publishStarted,
+      upEventFired,
+      lastError,
+      interfaces: os.networkInterfaces(),
+      flatIPv4: listIfs()
+    });
+  });
+
+  // cierre ordenado
+  function shutdown() {
+    log("Apagando…");
+    try { stop(() => log("[mDNS] detenido")); } catch {}
+    try { server.close(() => log("HTTP/WS cerrado")); } catch {}
+  }
+  process.on("SIGINT", shutdown);
+  process.on("SIGTERM", shutdown);
+
+  return { start, stop };
+})();
